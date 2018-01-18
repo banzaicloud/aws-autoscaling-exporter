@@ -2,14 +2,17 @@ package exporter
 
 import (
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 )
 
-// Exporter implements the prometheus.Exporter interface, and exports Redis metrics.
+// Exporter implements the prometheus.Exporter interface, and exports AWS AutoScaling metrics.
 type Exporter struct {
 	session      *session.Session
 	duration     prometheus.Gauge
@@ -18,6 +21,13 @@ type Exporter struct {
 	metrics      map[string]*prometheus.GaugeVec
 	metricsMtx   sync.RWMutex
 	sync.RWMutex
+}
+
+type scrapeResult struct {
+	Name             string
+	Value            float64
+	AutoScalingGroup string
+	Region           string
 }
 
 // NewAutoscalingExporter returns a new exporter of AWS Autoscaling group metrics.
@@ -102,5 +112,82 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect fetches info from the AWS API and the BanzaiCloud recommendation API
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
-	log.Info("collecting metrics...")
+
+	scrapes := make(chan scrapeResult)
+
+	e.Lock()
+	defer e.Unlock()
+
+	go e.scrape(scrapes)
+	e.setMetrics(scrapes)
+
+	e.duration.Collect(ch)
+	e.totalScrapes.Collect(ch)
+	e.scrapeErrors.Collect(ch)
+
+	for _, m := range e.metrics {
+		m.Collect(ch)
+	}
+}
+
+func (e *Exporter) scrape(scrapes chan<- scrapeResult) {
+
+	defer close(scrapes)
+	now := time.Now().UnixNano()
+	e.totalScrapes.Inc()
+
+	var errorCount uint64 = 0
+
+	asgSvc := autoscaling.New(e.session, aws.NewConfig())
+
+	// TODO: API pagination
+	result, err := asgSvc.DescribeAutoScalingGroups(&autoscaling.DescribeAutoScalingGroupsInput{})
+	if err != nil {
+		log.WithError(err).Error("An error happened while fetching AutoScaling Groups")
+		errorCount++
+	}
+	log.Debug("Number of AutoScaling Groups found:", len(result.AutoScalingGroups))
+
+	var wg sync.WaitGroup
+	for _, asg := range result.AutoScalingGroups {
+		wg.Add(1)
+		go func(asg *autoscaling.Group) {
+			defer wg.Done()
+			if err := e.scrapeAsg(scrapes, asg); err != nil {
+				log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Error(err)
+				atomic.AddUint64(&errorCount, 1)
+			}
+		}(asg)
+	}
+	wg.Wait()
+
+	e.scrapeErrors.Set(float64(atomic.LoadUint64(&errorCount)))
+	e.duration.Set(float64(time.Now().UnixNano()-now) / 1000000000)
+}
+
+func (e *Exporter) setMetrics(scrapes <-chan scrapeResult) {
+	for scr := range scrapes {
+		name := scr.Name
+		if _, ok := e.metrics[name]; !ok {
+			e.metricsMtx.Lock()
+			e.metrics[name] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: "aws_autoscaling",
+				Name:      name,
+			}, []string{"asg_name", "region"})
+			e.metricsMtx.Unlock()
+		}
+		var labels prometheus.Labels = map[string]string{"asg_name": scr.AutoScalingGroup, "region": scr.Region}
+		e.metrics[name].With(labels).Set(float64(scr.Value))
+	}
+}
+
+func (e *Exporter) scrapeAsg(scrapes chan<- scrapeResult, asg *autoscaling.Group) error {
+	log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Debug("getting metrics about ASG")
+	scrapes <- scrapeResult{
+		Name:             "instances_total",
+		Value:            float64(len(asg.Instances)),
+		AutoScalingGroup: *asg.AutoScalingGroupName,
+		Region:           *e.session.Config.Region,
+	}
+	return nil
 }
