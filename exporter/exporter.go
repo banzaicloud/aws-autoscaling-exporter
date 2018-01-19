@@ -63,7 +63,7 @@ func NewAutoscalingExporter(region string) (*Exporter, error) {
 				Namespace: "aws_autoscaling",
 				Name:      "pending_instances_total",
 				Help:      "Total number of pending instances in the auto scaling group",
-			}, []string{"asg_name"}),
+			}, []string{"asg_name", "region"}),
 			"inservice_instances_total": prometheus.NewGaugeVec(prometheus.GaugeOpts{
 				Namespace: "aws_autoscaling",
 				Name:      "inservice_instances_total",
@@ -183,9 +183,49 @@ func (e *Exporter) setMetrics(scrapes <-chan scrapeResult) {
 
 func (e *Exporter) scrapeAsg(scrapes chan<- scrapeResult, asg *autoscaling.Group) error {
 	log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Debug("getting metrics about ASG")
+
+	var pendingInstances, inServiceInstances, standbyInstances, terminatingInstances int
+	for _, inst := range asg.Instances {
+		switch *inst.LifecycleState {
+		case "InService":
+			inServiceInstances++
+		case "Pending":
+			pendingInstances++
+		case "Terminating":
+			terminatingInstances++
+		case "Standby":
+			standbyInstances++
+		}
+
+	}
+
 	scrapes <- scrapeResult{
 		Name:             "instances_total",
 		Value:            float64(len(asg.Instances)),
+		AutoScalingGroup: *asg.AutoScalingGroupName,
+		Region:           *e.session.Config.Region,
+	}
+	scrapes <- scrapeResult{
+		Name:             "pending_instances_total",
+		Value:            float64(pendingInstances),
+		AutoScalingGroup: *asg.AutoScalingGroupName,
+		Region:           *e.session.Config.Region,
+	}
+	scrapes <- scrapeResult{
+		Name:             "inservice_instances_total",
+		Value:            float64(inServiceInstances),
+		AutoScalingGroup: *asg.AutoScalingGroupName,
+		Region:           *e.session.Config.Region,
+	}
+	scrapes <- scrapeResult{
+		Name:             "terminating_instances_total",
+		Value:            float64(terminatingInstances),
+		AutoScalingGroup: *asg.AutoScalingGroupName,
+		Region:           *e.session.Config.Region,
+	}
+	scrapes <- scrapeResult{
+		Name:             "standby_instances_total",
+		Value:            float64(standbyInstances),
 		AutoScalingGroup: *asg.AutoScalingGroupName,
 		Region:           *e.session.Config.Region,
 	}
