@@ -140,26 +140,26 @@ func (e *Exporter) scrape(scrapes chan<- scrapeResult) {
 
 	asgSvc := autoscaling.New(e.session, aws.NewConfig())
 
-	// TODO: API pagination
-	result, err := asgSvc.DescribeAutoScalingGroups(&autoscaling.DescribeAutoScalingGroupsInput{})
+	err := asgSvc.DescribeAutoScalingGroupsPages(&autoscaling.DescribeAutoScalingGroupsInput{}, func(result *autoscaling.DescribeAutoScalingGroupsOutput, lastPage bool) bool {
+		log.Debugf("Number of AutoScaling Groups found: %d [lastPage = %t]", len(result.AutoScalingGroups), lastPage)
+		var wg sync.WaitGroup
+		for _, asg := range result.AutoScalingGroups {
+			wg.Add(1)
+			go func(asg *autoscaling.Group) {
+				defer wg.Done()
+				if err := e.scrapeAsg(scrapes, asg); err != nil {
+					log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Error(err)
+					atomic.AddUint64(&errorCount, 1)
+				}
+			}(asg)
+		}
+		wg.Wait()
+		return true
+	})
 	if err != nil {
 		log.WithError(err).Error("An error happened while fetching AutoScaling Groups")
 		errorCount++
 	}
-	log.Debug("Number of AutoScaling Groups found:", len(result.AutoScalingGroups))
-
-	var wg sync.WaitGroup
-	for _, asg := range result.AutoScalingGroups {
-		wg.Add(1)
-		go func(asg *autoscaling.Group) {
-			defer wg.Done()
-			if err := e.scrapeAsg(scrapes, asg); err != nil {
-				log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Error(err)
-				atomic.AddUint64(&errorCount, 1)
-			}
-		}(asg)
-	}
-	wg.Wait()
 
 	e.scrapeErrors.Set(float64(atomic.LoadUint64(&errorCount)))
 	e.duration.Set(float64(time.Now().UnixNano()-now) / 1000000000)
@@ -182,7 +182,7 @@ func (e *Exporter) setMetrics(scrapes <-chan scrapeResult) {
 }
 
 func (e *Exporter) scrapeAsg(scrapes chan<- scrapeResult, asg *autoscaling.Group) error {
-	log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Debug("getting metrics about ASG")
+	log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Debug("getting metrics from the auto scaling group")
 
 	var pendingInstances, inServiceInstances, standbyInstances, terminatingInstances int
 	for _, inst := range asg.Instances {
