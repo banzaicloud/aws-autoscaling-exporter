@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
+	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 )
@@ -45,6 +46,13 @@ type InstanceTypeRecommendation struct {
 	SuggestedBidPrice  string  `json:"SuggestedBidPrice"`
 	CostScore          string  `json:"CostScore"`
 	StabilityScore     float32 `json:"StabilityScore"`
+}
+
+type Instance struct {
+	InstanceId       string
+	InstanceType     string
+	AvailabilityZone string
+	SpotBidPrice     string
 }
 
 // NewAutoscalingExporter returns a new exporter of AWS Autoscaling group metrics.
@@ -205,6 +213,8 @@ func (e *Exporter) setMetrics(scrapes <-chan ScrapeResult) {
 }
 
 func (e *Exporter) getRecommendations() (*Recommendation, error) {
+
+	// TODO: base instance type: from LC of ASG
 	fullRecommendationUrl := fmt.Sprintf("%s/api/v1/recommender/%s", e.recommenderUrl, *e.session.Config.Region)
 	res, err := http.Get(fullRecommendationUrl)
 	if err != nil {
@@ -227,17 +237,22 @@ func (e *Exporter) getRecommendations() (*Recommendation, error) {
 func (e *Exporter) scrapeAsg(scrapes chan<- ScrapeResult, asg *autoscaling.Group, recommendation *Recommendation) error {
 	log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Debug("getting metrics from the auto scaling group")
 
-	var pendingInstances, inServiceInstances, standbyInstances, terminatingInstances int
-	for _, inst := range asg.Instances {
-		switch *inst.LifecycleState {
-		case "InService":
-			inServiceInstances++
-		case "Pending":
-			pendingInstances++
-		case "Terminating":
-			terminatingInstances++
-		case "Standby":
-			standbyInstances++
+	var pendingInstances, inServiceInstances, standbyInstances, terminatingInstances, spotInstances int
+	var instanceIds []*string
+
+	if len(asg.Instances) > 0 {
+		for _, inst := range asg.Instances {
+			switch *inst.LifecycleState {
+			case "InService":
+				inServiceInstances++
+			case "Pending":
+				pendingInstances++
+			case "Terminating":
+				terminatingInstances++
+			case "Standby":
+				standbyInstances++
+			}
+			instanceIds = append(instanceIds, inst.InstanceId)
 		}
 	}
 
@@ -272,10 +287,28 @@ func (e *Exporter) scrapeAsg(scrapes chan<- ScrapeResult, asg *autoscaling.Group
 		Region:           *e.session.Config.Region,
 	}
 
+	instances, err := e.scrapeInstances(*asg.AutoScalingGroupName, instanceIds)
+	if err != nil {
+		return err
+	}
+	for _, i := range instances {
+		if i.SpotBidPrice != "" {
+			spotInstances++
+		}
+	}
+
+	scrapes <- ScrapeResult{
+		Name:             "spot_instances_total",
+		Value:            float64(spotInstances),
+		AutoScalingGroup: *asg.AutoScalingGroupName,
+		Region:           *e.session.Config.Region,
+	}
+
 	if recommendation == nil {
 		return nil
 	}
 
+	// TODO: compare it with recommendations
 	scrapes <- ScrapeResult{
 		Name:             "unrecommended_spot_instances_total",
 		Value:            99,
@@ -284,4 +317,55 @@ func (e *Exporter) scrapeAsg(scrapes chan<- ScrapeResult, asg *autoscaling.Group
 	}
 
 	return nil
+}
+
+func (e *Exporter) scrapeInstances(asgName string, instanceIds []*string) ([]Instance, error) {
+	ec2Svc := ec2.New(e.session, aws.NewConfig())
+	var instances = make([]Instance, 0, len(instanceIds))
+	var spotRequests []*string
+
+	err := ec2Svc.DescribeInstancesPages(&ec2.DescribeInstancesInput{
+		InstanceIds: instanceIds,
+	}, func(output *ec2.DescribeInstancesOutput, lastPage bool) bool {
+		for _, reservation := range output.Reservations {
+			for _, instance := range reservation.Instances {
+				if instance.SpotInstanceRequestId != nil {
+					spotRequests = append(spotRequests, instance.SpotInstanceRequestId)
+				} else {
+					instance := Instance{
+						InstanceId:       *instance.InstanceId,
+						InstanceType:     *instance.InstanceType,
+						AvailabilityZone: *instance.Placement.AvailabilityZone,
+					}
+					instances = append(instances, instance)
+				}
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if len(spotRequests) > 0 {
+		// TODO: paginate?
+		describeSpotInstanceRequestsOutput, err := ec2Svc.DescribeSpotInstanceRequests(&ec2.DescribeSpotInstanceRequestsInput{
+			SpotInstanceRequestIds: spotRequests,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		for _, spotRequest := range describeSpotInstanceRequestsOutput.SpotInstanceRequests {
+			instance := Instance{
+				InstanceId:       *spotRequest.InstanceId,
+				InstanceType:     *spotRequest.LaunchSpecification.InstanceType,
+				AvailabilityZone: *spotRequest.LaunchedAvailabilityZone,
+				SpotBidPrice:     *spotRequest.SpotPrice,
+			}
+			instances = append(instances, instance)
+		}
+	}
+
+	return instances, nil
 }
