@@ -11,10 +11,11 @@ import (
 )
 
 var (
-	addr        = flag.String("listen-address", ":8089", "The address to listen on for HTTP requests.")
-	metricsPath = flag.String("metrics-path", "/metrics", "path to metrics endpoint")
-	rawLevel    = flag.String("log-level", "info", "log level")
-	region      = flag.String("region", "eu-west-1", "AWS region that the exporter should query")
+	addr           = flag.String("listen-address", ":8089", "The address to listen on for HTTP requests.")
+	metricsPath    = flag.String("metrics-path", "/metrics", "path to metrics endpoint")
+	rawLevel       = flag.String("log-level", "info", "log level")
+	region         = flag.String("region", "eu-west-1", "AWS region that the exporter should query")
+	recommenderUrl = flag.String("recommender-url", "http://localhost:9090", "URL of the spot instance recommender")
 )
 
 func init() {
@@ -32,7 +33,7 @@ func main() {
 	log.Info("Starting AWS Auto Scaling Group exporter")
 	log.Infof("Starting metric http endpoint on %s", *addr)
 
-	exporter, err := exporter.NewAutoscalingExporter(*region)
+	exporter, err := exporter.NewAutoscalingExporter(*region, *recommenderUrl)
 	if err != nil {
 		log.Fatal(err)
 	}

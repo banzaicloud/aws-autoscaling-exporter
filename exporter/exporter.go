@@ -1,6 +1,10 @@
 package exporter
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,24 +18,37 @@ import (
 
 // Exporter implements the prometheus.Exporter interface, and exports AWS AutoScaling metrics.
 type Exporter struct {
-	session      *session.Session
-	duration     prometheus.Gauge
-	scrapeErrors prometheus.Gauge
-	totalScrapes prometheus.Counter
-	metrics      map[string]*prometheus.GaugeVec
-	metricsMtx   sync.RWMutex
+	session        *session.Session
+	recommenderUrl string
+	duration       prometheus.Gauge
+	scrapeErrors   prometheus.Gauge
+	totalScrapes   prometheus.Counter
+	metrics        map[string]*prometheus.GaugeVec
+	metricsMtx     sync.RWMutex
 	sync.RWMutex
 }
 
-type scrapeResult struct {
+type ScrapeResult struct {
 	Name             string
 	Value            float64
 	AutoScalingGroup string
 	Region           string
 }
 
+type Recommendation map[string][]InstanceTypeRecommendation
+
+type InstanceTypeRecommendation struct {
+	InstanceTypeName   string  `json:"InstanceTypeName"`
+	CurrentPrice       string  `json:"CurrentPrice"`
+	AvgPriceFor24Hours float32 `json:"AvgPriceFor24Hours"`
+	OnDemandPrice      string  `json:"OnDemandPrice"`
+	SuggestedBidPrice  string  `json:"SuggestedBidPrice"`
+	CostScore          string  `json:"CostScore"`
+	StabilityScore     float32 `json:"StabilityScore"`
+}
+
 // NewAutoscalingExporter returns a new exporter of AWS Autoscaling group metrics.
-func NewAutoscalingExporter(region string) (*Exporter, error) {
+func NewAutoscalingExporter(region string, recommenderUrl string) (*Exporter, error) {
 
 	session, err := session.NewSession(&aws.Config{
 		Region: aws.String(region),
@@ -42,7 +59,8 @@ func NewAutoscalingExporter(region string) (*Exporter, error) {
 	}
 
 	e := Exporter{
-		session: session,
+		session:        session,
+		recommenderUrl: recommenderUrl,
 		duration: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "aws_autoscaling",
 			Name:      "scrape_duration_seconds",
@@ -113,7 +131,7 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 // Collect fetches info from the AWS API and the BanzaiCloud recommendation API
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 
-	scrapes := make(chan scrapeResult)
+	scrapes := make(chan ScrapeResult)
 
 	e.Lock()
 	defer e.Unlock()
@@ -130,7 +148,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-func (e *Exporter) scrape(scrapes chan<- scrapeResult) {
+func (e *Exporter) scrape(scrapes chan<- ScrapeResult) {
 
 	defer close(scrapes)
 	now := time.Now().UnixNano()
@@ -138,16 +156,21 @@ func (e *Exporter) scrape(scrapes chan<- scrapeResult) {
 
 	var errorCount uint64 = 0
 
-	asgSvc := autoscaling.New(e.session, aws.NewConfig())
+	recommendation, err := e.getRecommendations()
+	if err != nil {
+		log.WithError(err).Error("Failed to get recommendations, recommendation related metrics will not be reported.")
+		atomic.AddUint64(&errorCount, 1)
+	}
 
-	err := asgSvc.DescribeAutoScalingGroupsPages(&autoscaling.DescribeAutoScalingGroupsInput{}, func(result *autoscaling.DescribeAutoScalingGroupsOutput, lastPage bool) bool {
+	asgSvc := autoscaling.New(e.session, aws.NewConfig())
+	err = asgSvc.DescribeAutoScalingGroupsPages(&autoscaling.DescribeAutoScalingGroupsInput{}, func(result *autoscaling.DescribeAutoScalingGroupsOutput, lastPage bool) bool {
 		log.Debugf("Number of AutoScaling Groups found: %d [lastPage = %t]", len(result.AutoScalingGroups), lastPage)
 		var wg sync.WaitGroup
 		for _, asg := range result.AutoScalingGroups {
 			wg.Add(1)
 			go func(asg *autoscaling.Group) {
 				defer wg.Done()
-				if err := e.scrapeAsg(scrapes, asg); err != nil {
+				if err := e.scrapeAsg(scrapes, asg, recommendation); err != nil {
 					log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Error(err)
 					atomic.AddUint64(&errorCount, 1)
 				}
@@ -158,14 +181,14 @@ func (e *Exporter) scrape(scrapes chan<- scrapeResult) {
 	})
 	if err != nil {
 		log.WithError(err).Error("An error happened while fetching AutoScaling Groups")
-		errorCount++
+		atomic.AddUint64(&errorCount, 1)
 	}
 
 	e.scrapeErrors.Set(float64(atomic.LoadUint64(&errorCount)))
 	e.duration.Set(float64(time.Now().UnixNano()-now) / 1000000000)
 }
 
-func (e *Exporter) setMetrics(scrapes <-chan scrapeResult) {
+func (e *Exporter) setMetrics(scrapes <-chan ScrapeResult) {
 	for scr := range scrapes {
 		name := scr.Name
 		if _, ok := e.metrics[name]; !ok {
@@ -181,7 +204,27 @@ func (e *Exporter) setMetrics(scrapes <-chan scrapeResult) {
 	}
 }
 
-func (e *Exporter) scrapeAsg(scrapes chan<- scrapeResult, asg *autoscaling.Group) error {
+func (e *Exporter) getRecommendations() (*Recommendation, error) {
+	fullRecommendationUrl := fmt.Sprintf("%s/api/v1/recommender/%s", e.recommenderUrl, *e.session.Config.Region)
+	res, err := http.Get(fullRecommendationUrl)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	var recommendation *Recommendation
+	if res.StatusCode != http.StatusOK {
+		return nil, errors.New(fmt.Sprintf("Couldn't get recommendations: GET '%s': response code = '%s', expecting '200 OK'", fullRecommendationUrl, res.Status))
+	}
+	recommendation = new(Recommendation)
+	err = json.NewDecoder(res.Body).Decode(recommendation)
+	if err != nil {
+		return nil, err
+	}
+	return recommendation, nil
+}
+
+func (e *Exporter) scrapeAsg(scrapes chan<- ScrapeResult, asg *autoscaling.Group, recommendation *Recommendation) error {
 	log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Debug("getting metrics from the auto scaling group")
 
 	var pendingInstances, inServiceInstances, standbyInstances, terminatingInstances int
@@ -196,38 +239,49 @@ func (e *Exporter) scrapeAsg(scrapes chan<- scrapeResult, asg *autoscaling.Group
 		case "Standby":
 			standbyInstances++
 		}
-
 	}
 
-	scrapes <- scrapeResult{
+	scrapes <- ScrapeResult{
 		Name:             "instances_total",
 		Value:            float64(len(asg.Instances)),
 		AutoScalingGroup: *asg.AutoScalingGroupName,
 		Region:           *e.session.Config.Region,
 	}
-	scrapes <- scrapeResult{
+	scrapes <- ScrapeResult{
 		Name:             "pending_instances_total",
 		Value:            float64(pendingInstances),
 		AutoScalingGroup: *asg.AutoScalingGroupName,
 		Region:           *e.session.Config.Region,
 	}
-	scrapes <- scrapeResult{
+	scrapes <- ScrapeResult{
 		Name:             "inservice_instances_total",
 		Value:            float64(inServiceInstances),
 		AutoScalingGroup: *asg.AutoScalingGroupName,
 		Region:           *e.session.Config.Region,
 	}
-	scrapes <- scrapeResult{
+	scrapes <- ScrapeResult{
 		Name:             "terminating_instances_total",
 		Value:            float64(terminatingInstances),
 		AutoScalingGroup: *asg.AutoScalingGroupName,
 		Region:           *e.session.Config.Region,
 	}
-	scrapes <- scrapeResult{
+	scrapes <- ScrapeResult{
 		Name:             "standby_instances_total",
 		Value:            float64(standbyInstances),
 		AutoScalingGroup: *asg.AutoScalingGroupName,
 		Region:           *e.session.Config.Region,
 	}
+
+	if recommendation == nil {
+		return nil
+	}
+
+	scrapes <- ScrapeResult{
+		Name:             "unrecommended_spot_instances_total",
+		Value:            99,
+		AutoScalingGroup: *asg.AutoScalingGroupName,
+		Region:           *e.session.Config.Region,
+	}
+
 	return nil
 }
