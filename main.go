@@ -33,7 +33,7 @@ func main() {
 	log.Info("Starting AWS Auto Scaling Group exporter")
 	log.Infof("Starting metric http endpoint on %s", *addr)
 
-	exporter, err := exporter.NewAutoscalingExporter(*region, *recommenderUrl)
+	exporter, err := exporter.NewExporter(*region, *recommenderUrl)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,44 +20,60 @@ import (
 
 // Exporter implements the prometheus.Exporter interface, and exports AWS AutoScaling metrics.
 type Exporter struct {
-	session        *session.Session
-	recommenderUrl string
-	duration       prometheus.Gauge
-	scrapeErrors   prometheus.Gauge
-	totalScrapes   prometheus.Counter
-	metrics        map[string]*prometheus.GaugeVec
-	metricsMtx     sync.RWMutex
+	session         *session.Session
+	recommenderUrl  string
+	duration        prometheus.Gauge
+	scrapeErrors    prometheus.Gauge
+	totalScrapes    prometheus.Counter
+	groupMetrics    map[string]*prometheus.GaugeVec
+	instanceMetrics map[string]*prometheus.GaugeVec
+	metricsMtx      sync.RWMutex
 	sync.RWMutex
 }
 
-type ScrapeResult struct {
+type GroupScrapeResult struct {
 	Name             string
 	Value            float64
 	AutoScalingGroup string
 	Region           string
 }
 
+type InstanceScrapeResult struct {
+	Name             string
+	Value            float64
+	AutoScalingGroup string
+	Region           string
+	InstanceId       string
+	AvailabilityZone string
+	InstanceType     string
+}
+
 type Recommendation map[string][]InstanceTypeRecommendation
 
 type InstanceTypeRecommendation struct {
-	InstanceTypeName   string  `json:"InstanceTypeName"`
-	CurrentPrice       string  `json:"CurrentPrice"`
-	AvgPriceFor24Hours float32 `json:"AvgPriceFor24Hours"`
-	OnDemandPrice      string  `json:"OnDemandPrice"`
-	SuggestedBidPrice  string  `json:"SuggestedBidPrice"`
-	CostScore          string  `json:"CostScore"`
-	StabilityScore     float32 `json:"StabilityScore"`
+	InstanceTypeName   string `json:"InstanceTypeName"`
+	CurrentPrice       string `json:"CurrentPrice"`
+	AvgPriceFor24Hours string `json:"AvgPriceFor24Hours"`
+	OnDemandPrice      string `json:"OnDemandPrice"`
+	SuggestedBidPrice  string `json:"SuggestedBidPrice"`
+	CostScore          string `json:"CostScore"`
+	StabilityScore     string `json:"StabilityScore"`
 }
 
 type Instance struct {
 	InstanceId       string
 	InstanceType     string
 	AvailabilityZone string
-	SpotBidPrice     string
+	SpotBidPrice     float64
+	CostScore        float64
+	StabilityScore   float64
+	OptimalBidPrice  float64
+	OnDemandPrice    float64
+	CurrentPrice     float64
 }
 
-// NewAutoscalingExporter returns a new exporter of AWS Autoscaling group metrics.
-func NewAutoscalingExporter(region string, recommenderUrl string) (*Exporter, error) {
+// NewExporter returns a new exporter of AWS Autoscaling group metrics.
+func NewExporter(region string, recommenderUrl string) (*Exporter, error) {
 
 	session, err := session.NewSession(&aws.Config{
 		Region: aws.String(region),
@@ -84,7 +101,7 @@ func NewAutoscalingExporter(region string, recommenderUrl string) (*Exporter, er
 			Name:      "scrape_error",
 			Help:      "The scrape error status.",
 		}),
-		metrics: map[string]*prometheus.GaugeVec{
+		groupMetrics: map[string]*prometheus.GaugeVec{
 			"pending_instances_total": prometheus.NewGaugeVec(prometheus.GaugeOpts{
 				Namespace: "aws_autoscaling",
 				Name:      "pending_instances_total",
@@ -105,11 +122,6 @@ func NewAutoscalingExporter(region string, recommenderUrl string) (*Exporter, er
 				Name:      "terminating_instances_total",
 				Help:      "Total number of terminating instances in the auto scaling group",
 			}, []string{"asg_name", "region"}),
-			"unrecommended_spot_instances_total": prometheus.NewGaugeVec(prometheus.GaugeOpts{
-				Namespace: "aws_autoscaling",
-				Name:      "unrecommended_spot_instances_total",
-				Help:      "Total number of unrecommended spot instances in the auto scaling group",
-			}, []string{"asg_name", "region"}),
 			"spot_instances_total": prometheus.NewGaugeVec(prometheus.GaugeOpts{
 				Namespace: "aws_autoscaling",
 				Name:      "spot_instances_total",
@@ -121,6 +133,38 @@ func NewAutoscalingExporter(region string, recommenderUrl string) (*Exporter, er
 				Help:      "Total number of instances in the auto scaling group",
 			}, []string{"asg_name", "region"}),
 		},
+		instanceMetrics: map[string]*prometheus.GaugeVec{
+			"spot_bid_price": prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: "aws_instance",
+				Name:      "spot_bid_price",
+				Help:      "Spot bid price used to request the spot instance",
+			}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"}),
+			"cost_score": prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: "aws_instance",
+				Name:      "cost_score",
+				Help:      "Current cost score of spot instance reported by the spot recommender",
+			}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"}),
+			"stability_score": prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: "aws_instance",
+				Name:      "stability_score",
+				Help:      "Current stability score of spot instance reported by the spot recommender",
+			}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"}),
+			"on_demand_price": prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: "aws_instance",
+				Name:      "on_demand_price",
+				Help:      "Current on demand price of spot instance reported by the spot recommender",
+			}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"}),
+			"optimal_bid_price": prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: "aws_instance",
+				Name:      "optimal_bid_price",
+				Help:      "Optimal spot bid price of instance reported by the spot recommender",
+			}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"}),
+			"current_price": prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: "aws_instance",
+				Name:      "current_price",
+				Help:      "Current price of spot instance reported by the spot recommender.",
+			}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"}),
+		},
 	}
 
 	return &e, nil
@@ -128,7 +172,10 @@ func NewAutoscalingExporter(region string, recommenderUrl string) (*Exporter, er
 
 // Describe outputs metric descriptions.
 func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
-	for _, m := range e.metrics {
+	for _, m := range e.groupMetrics {
+		m.Describe(ch)
+	}
+	for _, m := range e.instanceMetrics {
 		m.Describe(ch)
 	}
 	ch <- e.duration.Desc()
@@ -139,46 +186,73 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 // Collect fetches info from the AWS API and the BanzaiCloud recommendation API
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 
-	scrapes := make(chan ScrapeResult)
+	groupScrapes := make(chan GroupScrapeResult)
+	instanceScrapes := make(chan InstanceScrapeResult)
 
 	e.Lock()
 	defer e.Unlock()
 
-	go e.scrape(scrapes)
-	e.setMetrics(scrapes)
+	go e.scrape(groupScrapes, instanceScrapes)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		e.setGroupMetrics(groupScrapes)
+	}()
+	go func() {
+		defer wg.Done()
+		e.setInstanceMetrics(instanceScrapes)
+	}()
+	wg.Wait()
 
 	e.duration.Collect(ch)
 	e.totalScrapes.Collect(ch)
 	e.scrapeErrors.Collect(ch)
 
-	for _, m := range e.metrics {
+	for _, m := range e.groupMetrics {
+		m.Collect(ch)
+	}
+	for _, m := range e.instanceMetrics {
 		m.Collect(ch)
 	}
 }
 
-func (e *Exporter) scrape(scrapes chan<- ScrapeResult) {
+func (e *Exporter) scrape(groupScrapes chan<- GroupScrapeResult, instanceScrapes chan<- InstanceScrapeResult) {
 
-	defer close(scrapes)
+	defer close(groupScrapes)
+	defer close(instanceScrapes)
 	now := time.Now().UnixNano()
 	e.totalScrapes.Inc()
 
 	var errorCount uint64 = 0
 
-	recommendation, err := e.getRecommendations()
-	if err != nil {
-		log.WithError(err).Error("Failed to get recommendations, recommendation related metrics will not be reported.")
-		atomic.AddUint64(&errorCount, 1)
-	}
-
 	asgSvc := autoscaling.New(e.session, aws.NewConfig())
-	err = asgSvc.DescribeAutoScalingGroupsPages(&autoscaling.DescribeAutoScalingGroupsInput{}, func(result *autoscaling.DescribeAutoScalingGroupsOutput, lastPage bool) bool {
+	err := asgSvc.DescribeAutoScalingGroupsPages(&autoscaling.DescribeAutoScalingGroupsInput{}, func(result *autoscaling.DescribeAutoScalingGroupsOutput, lastPage bool) bool {
 		log.Debugf("Number of AutoScaling Groups found: %d [lastPage = %t]", len(result.AutoScalingGroups), lastPage)
 		var wg sync.WaitGroup
 		for _, asg := range result.AutoScalingGroups {
 			wg.Add(1)
 			go func(asg *autoscaling.Group) {
 				defer wg.Done()
-				if err := e.scrapeAsg(scrapes, asg, recommendation); err != nil {
+				var recommendation *Recommendation
+				describeLcOutput, err := asgSvc.DescribeLaunchConfigurations(&autoscaling.DescribeLaunchConfigurationsInput{
+					LaunchConfigurationNames: []*string{asg.LaunchConfigurationName},
+				})
+				if err != nil {
+					log.WithError(err).Error("Failed to fetch launch configuration for auto scaling group, recommendation related metrics will not be reported.")
+					atomic.AddUint64(&errorCount, 1)
+				} else if len(describeLcOutput.LaunchConfigurations) != 1 {
+					log.Error("Failed to fetch launch configuration for auto scaling group, recommendation related metrics will not be reported.")
+					atomic.AddUint64(&errorCount, 1)
+				} else {
+					recommendation, err = e.getRecommendations(*describeLcOutput.LaunchConfigurations[0].InstanceType)
+					if err != nil {
+						log.WithError(err).Error("Failed to get recommendations, recommendation related metrics will not be reported.")
+						atomic.AddUint64(&errorCount, 1)
+					}
+				}
+				if err := e.scrapeAsg(groupScrapes, instanceScrapes, asg, recommendation); err != nil {
 					log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Error(err)
 					atomic.AddUint64(&errorCount, 1)
 				}
@@ -196,26 +270,51 @@ func (e *Exporter) scrape(scrapes chan<- ScrapeResult) {
 	e.duration.Set(float64(time.Now().UnixNano()-now) / 1000000000)
 }
 
-func (e *Exporter) setMetrics(scrapes <-chan ScrapeResult) {
+func (e *Exporter) setGroupMetrics(scrapes <-chan GroupScrapeResult) {
+	log.Debug("set group metrics")
 	for scr := range scrapes {
 		name := scr.Name
-		if _, ok := e.metrics[name]; !ok {
+		if _, ok := e.groupMetrics[name]; !ok {
 			e.metricsMtx.Lock()
-			e.metrics[name] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			e.groupMetrics[name] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 				Namespace: "aws_autoscaling",
 				Name:      name,
 			}, []string{"asg_name", "region"})
 			e.metricsMtx.Unlock()
 		}
 		var labels prometheus.Labels = map[string]string{"asg_name": scr.AutoScalingGroup, "region": scr.Region}
-		e.metrics[name].With(labels).Set(float64(scr.Value))
+		e.groupMetrics[name].With(labels).Set(float64(scr.Value))
 	}
 }
 
-func (e *Exporter) getRecommendations() (*Recommendation, error) {
+func (e *Exporter) setInstanceMetrics(scrapes <-chan InstanceScrapeResult) {
+	log.Debug("set instance metrics")
+	for scr := range scrapes {
+		name := scr.Name
+		if _, ok := e.instanceMetrics[name]; !ok {
+			e.metricsMtx.Lock()
+			e.instanceMetrics[name] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: "aws_instance",
+				Name:      name,
+			}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"})
+			e.metricsMtx.Unlock()
+		}
+		var labels prometheus.Labels = map[string]string{
+			"asg_name":          scr.AutoScalingGroup,
+			"region":            scr.Region,
+			"instance_id":       scr.InstanceId,
+			"instance_type":     scr.InstanceType,
+			"availability_zone": scr.AvailabilityZone,
+		}
+		e.instanceMetrics[name].With(labels).Set(float64(scr.Value))
+	}
+}
 
-	// TODO: base instance type: from LC of ASG
-	fullRecommendationUrl := fmt.Sprintf("%s/api/v1/recommender/%s", e.recommenderUrl, *e.session.Config.Region)
+func (e *Exporter) getRecommendations(instanceType string) (*Recommendation, error) {
+	if instanceType == "" {
+		return nil, errors.New("no instance type specified for recommendation")
+	}
+	fullRecommendationUrl := fmt.Sprintf("%s/api/v1/recommender/%s?baseInstanceType=%s", e.recommenderUrl, *e.session.Config.Region, instanceType)
 	res, err := http.Get(fullRecommendationUrl)
 	if err != nil {
 		return nil, err
@@ -234,7 +333,7 @@ func (e *Exporter) getRecommendations() (*Recommendation, error) {
 	return recommendation, nil
 }
 
-func (e *Exporter) scrapeAsg(scrapes chan<- ScrapeResult, asg *autoscaling.Group, recommendation *Recommendation) error {
+func (e *Exporter) scrapeAsg(groupScrapes chan<- GroupScrapeResult, instanceScrapes chan<- InstanceScrapeResult, asg *autoscaling.Group, recommendation *Recommendation) error {
 	log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Debug("getting metrics from the auto scaling group")
 
 	var pendingInstances, inServiceInstances, standbyInstances, terminatingInstances, spotInstances int
@@ -256,48 +355,104 @@ func (e *Exporter) scrapeAsg(scrapes chan<- ScrapeResult, asg *autoscaling.Group
 		}
 	}
 
-	scrapes <- ScrapeResult{
+	groupScrapes <- GroupScrapeResult{
 		Name:             "instances_total",
 		Value:            float64(len(asg.Instances)),
 		AutoScalingGroup: *asg.AutoScalingGroupName,
 		Region:           *e.session.Config.Region,
 	}
-	scrapes <- ScrapeResult{
+	groupScrapes <- GroupScrapeResult{
 		Name:             "pending_instances_total",
 		Value:            float64(pendingInstances),
 		AutoScalingGroup: *asg.AutoScalingGroupName,
 		Region:           *e.session.Config.Region,
 	}
-	scrapes <- ScrapeResult{
+	groupScrapes <- GroupScrapeResult{
 		Name:             "inservice_instances_total",
 		Value:            float64(inServiceInstances),
 		AutoScalingGroup: *asg.AutoScalingGroupName,
 		Region:           *e.session.Config.Region,
 	}
-	scrapes <- ScrapeResult{
+	groupScrapes <- GroupScrapeResult{
 		Name:             "terminating_instances_total",
 		Value:            float64(terminatingInstances),
 		AutoScalingGroup: *asg.AutoScalingGroupName,
 		Region:           *e.session.Config.Region,
 	}
-	scrapes <- ScrapeResult{
+	groupScrapes <- GroupScrapeResult{
 		Name:             "standby_instances_total",
 		Value:            float64(standbyInstances),
 		AutoScalingGroup: *asg.AutoScalingGroupName,
 		Region:           *e.session.Config.Region,
 	}
 
-	instances, err := e.scrapeInstances(*asg.AutoScalingGroupName, instanceIds)
+	instances, err := e.scrapeInstances(*asg.AutoScalingGroupName, instanceIds, recommendation)
 	if err != nil {
 		return err
 	}
+
 	for _, i := range instances {
-		if i.SpotBidPrice != "" {
+		if i.SpotBidPrice > 0 {
+			// TODO: if -1 -> Error + 1 (use custom error)
 			spotInstances++
+			instanceScrapes <- InstanceScrapeResult{
+				Name:             "spot_bid_price",
+				Value:            i.SpotBidPrice,
+				AutoScalingGroup: *asg.AutoScalingGroupName,
+				Region:           *e.session.Config.Region,
+				InstanceId:       i.InstanceId,
+				AvailabilityZone: i.AvailabilityZone,
+				InstanceType:     i.InstanceType,
+			}
+			instanceScrapes <- InstanceScrapeResult{
+				Name:             "cost_score",
+				Value:            i.CostScore,
+				AutoScalingGroup: *asg.AutoScalingGroupName,
+				Region:           *e.session.Config.Region,
+				InstanceId:       i.InstanceId,
+				AvailabilityZone: i.AvailabilityZone,
+				InstanceType:     i.InstanceType,
+			}
+			instanceScrapes <- InstanceScrapeResult{
+				Name:             "stability_score",
+				Value:            i.StabilityScore,
+				AutoScalingGroup: *asg.AutoScalingGroupName,
+				Region:           *e.session.Config.Region,
+				InstanceId:       i.InstanceId,
+				AvailabilityZone: i.AvailabilityZone,
+				InstanceType:     i.InstanceType,
+			}
+			instanceScrapes <- InstanceScrapeResult{
+				Name:             "current_price",
+				Value:            i.CurrentPrice,
+				AutoScalingGroup: *asg.AutoScalingGroupName,
+				Region:           *e.session.Config.Region,
+				InstanceId:       i.InstanceId,
+				AvailabilityZone: i.AvailabilityZone,
+				InstanceType:     i.InstanceType,
+			}
+			instanceScrapes <- InstanceScrapeResult{
+				Name:             "on_demand_price",
+				Value:            i.OnDemandPrice,
+				AutoScalingGroup: *asg.AutoScalingGroupName,
+				Region:           *e.session.Config.Region,
+				InstanceId:       i.InstanceId,
+				AvailabilityZone: i.AvailabilityZone,
+				InstanceType:     i.InstanceType,
+			}
+			instanceScrapes <- InstanceScrapeResult{
+				Name:             "optimal_bid_price",
+				Value:            i.OptimalBidPrice,
+				AutoScalingGroup: *asg.AutoScalingGroupName,
+				Region:           *e.session.Config.Region,
+				InstanceId:       i.InstanceId,
+				AvailabilityZone: i.AvailabilityZone,
+				InstanceType:     i.InstanceType,
+			}
 		}
 	}
 
-	scrapes <- ScrapeResult{
+	groupScrapes <- GroupScrapeResult{
 		Name:             "spot_instances_total",
 		Value:            float64(spotInstances),
 		AutoScalingGroup: *asg.AutoScalingGroupName,
@@ -308,18 +463,10 @@ func (e *Exporter) scrapeAsg(scrapes chan<- ScrapeResult, asg *autoscaling.Group
 		return nil
 	}
 
-	// TODO: compare it with recommendations
-	scrapes <- ScrapeResult{
-		Name:             "unrecommended_spot_instances_total",
-		Value:            99,
-		AutoScalingGroup: *asg.AutoScalingGroupName,
-		Region:           *e.session.Config.Region,
-	}
-
 	return nil
 }
 
-func (e *Exporter) scrapeInstances(asgName string, instanceIds []*string) ([]Instance, error) {
+func (e *Exporter) scrapeInstances(asgName string, instanceIds []*string, recommendation *Recommendation) ([]Instance, error) {
 	ec2Svc := ec2.New(e.session, aws.NewConfig())
 	var instances = make([]Instance, 0, len(instanceIds))
 	var spotRequests []*string
@@ -336,6 +483,7 @@ func (e *Exporter) scrapeInstances(asgName string, instanceIds []*string) ([]Ins
 						InstanceId:       *instance.InstanceId,
 						InstanceType:     *instance.InstanceType,
 						AvailabilityZone: *instance.Placement.AvailabilityZone,
+						SpotBidPrice:     0,
 					}
 					instances = append(instances, instance)
 				}
@@ -348,7 +496,6 @@ func (e *Exporter) scrapeInstances(asgName string, instanceIds []*string) ([]Ins
 	}
 
 	if len(spotRequests) > 0 {
-		// TODO: paginate?
 		describeSpotInstanceRequestsOutput, err := ec2Svc.DescribeSpotInstanceRequests(&ec2.DescribeSpotInstanceRequestsInput{
 			SpotInstanceRequestIds: spotRequests,
 		})
@@ -361,7 +508,50 @@ func (e *Exporter) scrapeInstances(asgName string, instanceIds []*string) ([]Ins
 				InstanceId:       *spotRequest.InstanceId,
 				InstanceType:     *spotRequest.LaunchSpecification.InstanceType,
 				AvailabilityZone: *spotRequest.LaunchedAvailabilityZone,
-				SpotBidPrice:     *spotRequest.SpotPrice,
+			}
+			spotBidPrice, err := strconv.ParseFloat(*spotRequest.SpotPrice, 64)
+			if err != nil {
+				log.Error(err)
+				spotBidPrice = -1
+			}
+			instance.SpotBidPrice = spotBidPrice
+
+			if recommendation != nil {
+				for _, instanceTypeRecommendation := range (*recommendation)[*spotRequest.LaunchedAvailabilityZone] {
+					if instanceTypeRecommendation.InstanceTypeName == *spotRequest.LaunchSpecification.InstanceType {
+						costScore, err := strconv.ParseFloat(instanceTypeRecommendation.CostScore, 64)
+						if err != nil {
+							log.Error(err)
+							costScore = -1
+						}
+						instance.CostScore = costScore
+						stabilityScore, err := strconv.ParseFloat(instanceTypeRecommendation.StabilityScore, 64)
+						if err != nil {
+							log.Error(err)
+							stabilityScore = -1
+						}
+						instance.StabilityScore = stabilityScore
+						currentPrice, err := strconv.ParseFloat(instanceTypeRecommendation.CurrentPrice, 64)
+						if err != nil {
+							log.Error(err)
+							currentPrice = -1
+						}
+						instance.CurrentPrice = currentPrice
+						onDemandPrice, err := strconv.ParseFloat(instanceTypeRecommendation.OnDemandPrice, 64)
+						if err != nil {
+							log.Error(err)
+							onDemandPrice = -1
+						}
+						instance.OnDemandPrice = onDemandPrice
+						optimalBidPrice, err := strconv.ParseFloat(instanceTypeRecommendation.SuggestedBidPrice, 64)
+						if err != nil {
+							log.Error(err)
+							optimalBidPrice = -1
+						}
+						instance.OptimalBidPrice = optimalBidPrice
+						break
+					}
+				}
 			}
 			instances = append(instances, instance)
 		}
