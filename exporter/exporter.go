@@ -60,16 +60,12 @@ type InstanceTypeRecommendation struct {
 	StabilityScore     string `json:"StabilityScore"`
 }
 
-type Instance struct {
-	InstanceId       string
-	InstanceType     string
-	AvailabilityZone string
-	SpotBidPrice     float64
-	CostScore        float64
-	StabilityScore   float64
-	OptimalBidPrice  float64
-	OnDemandPrice    float64
-	CurrentPrice     float64
+type instanceScrapeError struct {
+	count uint64
+}
+
+func (e *instanceScrapeError) Error() string {
+	return fmt.Sprintf("Error count: %d", e.count)
 }
 
 // NewExporter returns a new exporter of AWS Autoscaling group metrics.
@@ -254,7 +250,12 @@ func (e *Exporter) scrape(groupScrapes chan<- GroupScrapeResult, instanceScrapes
 				}
 				if err := e.scrapeAsg(groupScrapes, instanceScrapes, asg, recommendation); err != nil {
 					log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Error(err)
-					atomic.AddUint64(&errorCount, 1)
+					if e, ok := err.(*instanceScrapeError); ok {
+						atomic.AddUint64(&errorCount, e.count)
+					} else {
+						atomic.AddUint64(&errorCount, 1)
+					}
+
 				}
 			}(asg)
 		}
@@ -386,69 +387,13 @@ func (e *Exporter) scrapeAsg(groupScrapes chan<- GroupScrapeResult, instanceScra
 		Region:           *e.session.Config.Region,
 	}
 
-	instances, err := e.scrapeInstances(*asg.AutoScalingGroupName, instanceIds, recommendation)
+	var countError *instanceScrapeError
+	spotInstances, err := e.scrapeInstances(instanceScrapes, *asg.AutoScalingGroupName, instanceIds, recommendation)
 	if err != nil {
-		return err
-	}
-
-	for _, i := range instances {
-		if i.SpotBidPrice > 0 {
-			// TODO: if -1 -> Error + 1 (use custom error)
-			spotInstances++
-			instanceScrapes <- InstanceScrapeResult{
-				Name:             "spot_bid_price",
-				Value:            i.SpotBidPrice,
-				AutoScalingGroup: *asg.AutoScalingGroupName,
-				Region:           *e.session.Config.Region,
-				InstanceId:       i.InstanceId,
-				AvailabilityZone: i.AvailabilityZone,
-				InstanceType:     i.InstanceType,
-			}
-			instanceScrapes <- InstanceScrapeResult{
-				Name:             "cost_score",
-				Value:            i.CostScore,
-				AutoScalingGroup: *asg.AutoScalingGroupName,
-				Region:           *e.session.Config.Region,
-				InstanceId:       i.InstanceId,
-				AvailabilityZone: i.AvailabilityZone,
-				InstanceType:     i.InstanceType,
-			}
-			instanceScrapes <- InstanceScrapeResult{
-				Name:             "stability_score",
-				Value:            i.StabilityScore,
-				AutoScalingGroup: *asg.AutoScalingGroupName,
-				Region:           *e.session.Config.Region,
-				InstanceId:       i.InstanceId,
-				AvailabilityZone: i.AvailabilityZone,
-				InstanceType:     i.InstanceType,
-			}
-			instanceScrapes <- InstanceScrapeResult{
-				Name:             "current_price",
-				Value:            i.CurrentPrice,
-				AutoScalingGroup: *asg.AutoScalingGroupName,
-				Region:           *e.session.Config.Region,
-				InstanceId:       i.InstanceId,
-				AvailabilityZone: i.AvailabilityZone,
-				InstanceType:     i.InstanceType,
-			}
-			instanceScrapes <- InstanceScrapeResult{
-				Name:             "on_demand_price",
-				Value:            i.OnDemandPrice,
-				AutoScalingGroup: *asg.AutoScalingGroupName,
-				Region:           *e.session.Config.Region,
-				InstanceId:       i.InstanceId,
-				AvailabilityZone: i.AvailabilityZone,
-				InstanceType:     i.InstanceType,
-			}
-			instanceScrapes <- InstanceScrapeResult{
-				Name:             "optimal_bid_price",
-				Value:            i.OptimalBidPrice,
-				AutoScalingGroup: *asg.AutoScalingGroupName,
-				Region:           *e.session.Config.Region,
-				InstanceId:       i.InstanceId,
-				AvailabilityZone: i.AvailabilityZone,
-				InstanceType:     i.InstanceType,
-			}
+		if e, ok := err.(*instanceScrapeError); ok {
+			countError = e
+		} else {
+			return err
 		}
 	}
 
@@ -459,16 +404,15 @@ func (e *Exporter) scrapeAsg(groupScrapes chan<- GroupScrapeResult, instanceScra
 		Region:           *e.session.Config.Region,
 	}
 
-	if recommendation == nil {
-		return nil
+	if countError != nil {
+		return countError
 	}
-
 	return nil
 }
 
-func (e *Exporter) scrapeInstances(asgName string, instanceIds []*string, recommendation *Recommendation) ([]Instance, error) {
+func (e *Exporter) scrapeInstances(scrapes chan<- InstanceScrapeResult, asgName string, instanceIds []*string, recommendation *Recommendation) (int, error) {
+	var errorCount uint64
 	ec2Svc := ec2.New(e.session, aws.NewConfig())
-	var instances = make([]Instance, 0, len(instanceIds))
 	var spotRequests []*string
 
 	err := ec2Svc.DescribeInstancesPages(&ec2.DescribeInstancesInput{
@@ -478,21 +422,13 @@ func (e *Exporter) scrapeInstances(asgName string, instanceIds []*string, recomm
 			for _, instance := range reservation.Instances {
 				if instance.SpotInstanceRequestId != nil {
 					spotRequests = append(spotRequests, instance.SpotInstanceRequestId)
-				} else {
-					instance := Instance{
-						InstanceId:       *instance.InstanceId,
-						InstanceType:     *instance.InstanceType,
-						AvailabilityZone: *instance.Placement.AvailabilityZone,
-						SpotBidPrice:     0,
-					}
-					instances = append(instances, instance)
 				}
 			}
 		}
 		return true
 	})
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 
 	if len(spotRequests) > 0 {
@@ -500,21 +436,24 @@ func (e *Exporter) scrapeInstances(asgName string, instanceIds []*string, recomm
 			SpotInstanceRequestIds: spotRequests,
 		})
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 
 		for _, spotRequest := range describeSpotInstanceRequestsOutput.SpotInstanceRequests {
-			instance := Instance{
-				InstanceId:       *spotRequest.InstanceId,
-				InstanceType:     *spotRequest.LaunchSpecification.InstanceType,
-				AvailabilityZone: *spotRequest.LaunchedAvailabilityZone,
-			}
 			spotBidPrice, err := strconv.ParseFloat(*spotRequest.SpotPrice, 64)
 			if err != nil {
 				log.Error(err)
-				spotBidPrice = -1
+			} else {
+				scrapes <- InstanceScrapeResult{
+					Name:             "spot_bid_price",
+					Value:            spotBidPrice,
+					AutoScalingGroup: asgName,
+					Region:           *e.session.Config.Region,
+					InstanceId:       *spotRequest.InstanceId,
+					AvailabilityZone: *spotRequest.LaunchedAvailabilityZone,
+					InstanceType:     *spotRequest.LaunchSpecification.InstanceType,
+				}
 			}
-			instance.SpotBidPrice = spotBidPrice
 
 			if recommendation != nil {
 				for _, instanceTypeRecommendation := range (*recommendation)[*spotRequest.LaunchedAvailabilityZone] {
@@ -522,40 +461,87 @@ func (e *Exporter) scrapeInstances(asgName string, instanceIds []*string, recomm
 						costScore, err := strconv.ParseFloat(instanceTypeRecommendation.CostScore, 64)
 						if err != nil {
 							log.Error(err)
-							costScore = -1
+							errorCount++
+						} else {
+							scrapes <- InstanceScrapeResult{
+								Name:             "cost_score",
+								Value:            costScore,
+								AutoScalingGroup: asgName,
+								Region:           *e.session.Config.Region,
+								InstanceId:       *spotRequest.InstanceId,
+								AvailabilityZone: *spotRequest.LaunchedAvailabilityZone,
+								InstanceType:     *spotRequest.LaunchSpecification.InstanceType,
+							}
 						}
-						instance.CostScore = costScore
 						stabilityScore, err := strconv.ParseFloat(instanceTypeRecommendation.StabilityScore, 64)
 						if err != nil {
 							log.Error(err)
-							stabilityScore = -1
+							errorCount++
+						} else {
+							scrapes <- InstanceScrapeResult{
+								Name:             "stability_score",
+								Value:            stabilityScore,
+								AutoScalingGroup: asgName,
+								Region:           *e.session.Config.Region,
+								InstanceId:       *spotRequest.InstanceId,
+								AvailabilityZone: *spotRequest.LaunchedAvailabilityZone,
+								InstanceType:     *spotRequest.LaunchSpecification.InstanceType,
+							}
 						}
-						instance.StabilityScore = stabilityScore
 						currentPrice, err := strconv.ParseFloat(instanceTypeRecommendation.CurrentPrice, 64)
 						if err != nil {
 							log.Error(err)
-							currentPrice = -1
+							errorCount++
+						} else {
+							scrapes <- InstanceScrapeResult{
+								Name:             "current_price",
+								Value:            currentPrice,
+								AutoScalingGroup: asgName,
+								Region:           *e.session.Config.Region,
+								InstanceId:       *spotRequest.InstanceId,
+								AvailabilityZone: *spotRequest.LaunchedAvailabilityZone,
+								InstanceType:     *spotRequest.LaunchSpecification.InstanceType,
+							}
 						}
-						instance.CurrentPrice = currentPrice
 						onDemandPrice, err := strconv.ParseFloat(instanceTypeRecommendation.OnDemandPrice, 64)
 						if err != nil {
 							log.Error(err)
-							onDemandPrice = -1
+							errorCount++
+						} else {
+							scrapes <- InstanceScrapeResult{
+								Name:             "on_demand_price",
+								Value:            onDemandPrice,
+								AutoScalingGroup: asgName,
+								Region:           *e.session.Config.Region,
+								InstanceId:       *spotRequest.InstanceId,
+								AvailabilityZone: *spotRequest.LaunchedAvailabilityZone,
+								InstanceType:     *spotRequest.LaunchSpecification.InstanceType,
+							}
 						}
-						instance.OnDemandPrice = onDemandPrice
 						optimalBidPrice, err := strconv.ParseFloat(instanceTypeRecommendation.SuggestedBidPrice, 64)
 						if err != nil {
 							log.Error(err)
-							optimalBidPrice = -1
+							errorCount++
+						} else {
+							scrapes <- InstanceScrapeResult{
+								Name:             "optimal_bid_price",
+								Value:            optimalBidPrice,
+								AutoScalingGroup: asgName,
+								Region:           *e.session.Config.Region,
+								InstanceId:       *spotRequest.InstanceId,
+								AvailabilityZone: *spotRequest.LaunchedAvailabilityZone,
+								InstanceType:     *spotRequest.LaunchSpecification.InstanceType,
+							}
 						}
-						instance.OptimalBidPrice = optimalBidPrice
 						break
 					}
 				}
 			}
-			instances = append(instances, instance)
 		}
 	}
 
-	return instances, nil
+	if errorCount > 0 {
+		return len(spotRequests), &instanceScrapeError{errorCount}
+	}
+	return len(spotRequests), nil
 }
