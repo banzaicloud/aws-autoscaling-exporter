@@ -97,73 +97,77 @@ func NewExporter(region string, recommenderUrl string) (*Exporter, error) {
 			Name:      "scrape_error",
 			Help:      "The scrape error status.",
 		}),
-		groupMetrics: map[string]*prometheus.GaugeVec{
-			"pending_instances_total": prometheus.NewGaugeVec(prometheus.GaugeOpts{
-				Namespace: "aws_autoscaling",
-				Name:      "pending_instances_total",
-				Help:      "Total number of pending instances in the auto scaling group",
-			}, []string{"asg_name", "region"}),
-			"inservice_instances_total": prometheus.NewGaugeVec(prometheus.GaugeOpts{
-				Namespace: "aws_autoscaling",
-				Name:      "inservice_instances_total",
-				Help:      "Total number of in service instances in the auto scaling group",
-			}, []string{"asg_name", "region"}),
-			"standby_instances_total": prometheus.NewGaugeVec(prometheus.GaugeOpts{
-				Namespace: "aws_autoscaling",
-				Name:      "standby_instances_total",
-				Help:      "Total number of standby instances in the auto scaling group",
-			}, []string{"asg_name", "region"}),
-			"terminating_instances_total": prometheus.NewGaugeVec(prometheus.GaugeOpts{
-				Namespace: "aws_autoscaling",
-				Name:      "terminating_instances_total",
-				Help:      "Total number of terminating instances in the auto scaling group",
-			}, []string{"asg_name", "region"}),
-			"spot_instances_total": prometheus.NewGaugeVec(prometheus.GaugeOpts{
-				Namespace: "aws_autoscaling",
-				Name:      "spot_instances_total",
-				Help:      "Total number of spot instances in the auto scaling group",
-			}, []string{"asg_name", "region"}),
-			"instances_total": prometheus.NewGaugeVec(prometheus.GaugeOpts{
-				Namespace: "aws_autoscaling",
-				Name:      "instances_total",
-				Help:      "Total number of instances in the auto scaling group",
-			}, []string{"asg_name", "region"}),
-		},
-		instanceMetrics: map[string]*prometheus.GaugeVec{
-			"spot_bid_price": prometheus.NewGaugeVec(prometheus.GaugeOpts{
-				Namespace: "aws_instance",
-				Name:      "spot_bid_price",
-				Help:      "Spot bid price used to request the spot instance",
-			}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"}),
-			"cost_score": prometheus.NewGaugeVec(prometheus.GaugeOpts{
-				Namespace: "aws_instance",
-				Name:      "cost_score",
-				Help:      "Current cost score of spot instance reported by the spot recommender",
-			}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"}),
-			"stability_score": prometheus.NewGaugeVec(prometheus.GaugeOpts{
-				Namespace: "aws_instance",
-				Name:      "stability_score",
-				Help:      "Current stability score of spot instance reported by the spot recommender",
-			}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"}),
-			"on_demand_price": prometheus.NewGaugeVec(prometheus.GaugeOpts{
-				Namespace: "aws_instance",
-				Name:      "on_demand_price",
-				Help:      "Current on demand price of spot instance reported by the spot recommender",
-			}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"}),
-			"optimal_bid_price": prometheus.NewGaugeVec(prometheus.GaugeOpts{
-				Namespace: "aws_instance",
-				Name:      "optimal_bid_price",
-				Help:      "Optimal spot bid price of instance reported by the spot recommender",
-			}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"}),
-			"current_price": prometheus.NewGaugeVec(prometheus.GaugeOpts{
-				Namespace: "aws_instance",
-				Name:      "current_price",
-				Help:      "Current price of spot instance reported by the spot recommender.",
-			}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"}),
-		},
 	}
 
+	e.initGauges()
 	return &e, nil
+}
+
+func (e *Exporter) initGauges() {
+	e.groupMetrics = map[string]*prometheus.GaugeVec{}
+
+	e.groupMetrics["pending_instances_total"] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "aws_autoscaling",
+		Name:      "pending_instances_total",
+		Help:      "Total number of pending instances in the auto scaling group",
+	}, []string{"asg_name", "region"})
+	e.groupMetrics["inservice_instances_total"] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "aws_autoscaling",
+		Name:      "inservice_instances_total",
+		Help:      "Total number of in service instances in the auto scaling group",
+	}, []string{"asg_name", "region"})
+	e.groupMetrics["standby_instances_total"] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "aws_autoscaling",
+		Name:      "standby_instances_total",
+		Help:      "Total number of standby instances in the auto scaling group",
+	}, []string{"asg_name", "region"})
+	e.groupMetrics["terminating_instances_total"] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "aws_autoscaling",
+		Name:      "terminating_instances_total",
+		Help:      "Total number of terminating instances in the auto scaling group",
+	}, []string{"asg_name", "region"})
+	e.groupMetrics["spot_instances_total"] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "aws_autoscaling",
+		Name:      "spot_instances_total",
+		Help:      "Total number of spot instances in the auto scaling group",
+	}, []string{"asg_name", "region"})
+	e.groupMetrics["instances_total"] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "aws_autoscaling",
+		Name:      "instances_total",
+		Help:      "Total number of instances in the auto scaling group",
+	}, []string{"asg_name", "region"})
+
+	e.instanceMetrics = map[string]*prometheus.GaugeVec{}
+	e.instanceMetrics["spot_bid_price"] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "aws_instance",
+		Name:      "spot_bid_price",
+		Help:      "Spot bid price used to request the spot instance",
+	}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"})
+	e.instanceMetrics["cost_score"] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "aws_instance",
+		Name:      "cost_score",
+		Help:      "Current cost score of spot instance reported by the spot recommender",
+	}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"})
+	e.instanceMetrics["stability_score"] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "aws_instance",
+		Name:      "stability_score",
+		Help:      "Current stability score of spot instance reported by the spot recommender",
+	}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"})
+	e.instanceMetrics["on_demand_price"] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "aws_instance",
+		Name:      "on_demand_price",
+		Help:      "Current on demand price of spot instance reported by the spot recommender",
+	}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"})
+	e.instanceMetrics["optimal_bid_price"] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "aws_instance",
+		Name:      "optimal_bid_price",
+		Help:      "Optimal spot bid price of instance reported by the spot recommender",
+	}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"})
+	e.instanceMetrics["current_price"] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "aws_instance",
+		Name:      "current_price",
+		Help:      "Current price of spot instance reported by the spot recommender.",
+	}, []string{"asg_name", "region", "instance_id", "instance_type", "availability_zone"})
 }
 
 // Describe outputs metric descriptions.
@@ -188,6 +192,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	e.Lock()
 	defer e.Unlock()
 
+	e.initGauges()
 	go e.scrape(groupScrapes, instanceScrapes)
 
 	var wg sync.WaitGroup
