@@ -228,6 +228,7 @@ func (e *Exporter) scrape(groupScrapes chan<- GroupScrapeResult, instanceScrapes
 		log.Debugf("Number of AutoScaling Groups found: %d [lastPage = %t]", len(result.AutoScalingGroups), lastPage)
 		var wg sync.WaitGroup
 		for _, asg := range result.AutoScalingGroups {
+			log.Debug("scraping: ", *asg.AutoScalingGroupName)
 			wg.Add(1)
 			go func(asg *autoscaling.Group) {
 				defer wg.Done()
@@ -236,15 +237,15 @@ func (e *Exporter) scrape(groupScrapes chan<- GroupScrapeResult, instanceScrapes
 					LaunchConfigurationNames: []*string{asg.LaunchConfigurationName},
 				})
 				if err != nil {
-					log.WithError(err).Error("Failed to fetch launch configuration for auto scaling group, recommendation related metrics will not be reported.")
+					log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).WithError(err).Error("Failed to fetch launch configuration for auto scaling group, recommendation related metrics will not be reported.")
 					atomic.AddUint64(&errorCount, 1)
 				} else if len(describeLcOutput.LaunchConfigurations) != 1 {
-					log.Error("Failed to fetch launch configuration for auto scaling group, recommendation related metrics will not be reported.")
+					log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Error("Failed to fetch launch configuration for auto scaling group, recommendation related metrics will not be reported.")
 					atomic.AddUint64(&errorCount, 1)
 				} else {
 					recommendation, err = e.getRecommendations(*describeLcOutput.LaunchConfigurations[0].InstanceType)
 					if err != nil {
-						log.WithError(err).Error("Failed to get recommendations, recommendation related metrics will not be reported.")
+						log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).WithError(err).Error("Failed to get recommendations, recommendation related metrics will not be reported.")
 						atomic.AddUint64(&errorCount, 1)
 					}
 				}
@@ -388,12 +389,16 @@ func (e *Exporter) scrapeAsg(groupScrapes chan<- GroupScrapeResult, instanceScra
 	}
 
 	var countError *instanceScrapeError
-	spotInstances, err := e.scrapeInstances(instanceScrapes, *asg.AutoScalingGroupName, instanceIds, recommendation)
-	if err != nil {
-		if e, ok := err.(*instanceScrapeError); ok {
-			countError = e
-		} else {
-			return err
+	if len(instanceIds) > 0 {
+		var err error
+		log.WithField("autoScalingGroup", *asg.AutoScalingGroupName).Debug("getting metrics from the instances in the autoscaling group")
+		spotInstances, err = e.scrapeInstances(instanceScrapes, *asg.AutoScalingGroupName, instanceIds, recommendation)
+		if err != nil {
+			if e, ok := err.(*instanceScrapeError); ok {
+				countError = e
+			} else {
+				return err
+			}
 		}
 	}
 
@@ -442,7 +447,8 @@ func (e *Exporter) scrapeInstances(scrapes chan<- InstanceScrapeResult, asgName 
 		for _, spotRequest := range describeSpotInstanceRequestsOutput.SpotInstanceRequests {
 			spotBidPrice, err := strconv.ParseFloat(*spotRequest.SpotPrice, 64)
 			if err != nil {
-				log.Error(err)
+				log.WithField("autoScalingGroup", asgName).Error(err)
+				errorCount++
 			} else {
 				scrapes <- InstanceScrapeResult{
 					Name:             "spot_bid_price",
@@ -460,7 +466,7 @@ func (e *Exporter) scrapeInstances(scrapes chan<- InstanceScrapeResult, asgName 
 					if instanceTypeRecommendation.InstanceTypeName == *spotRequest.LaunchSpecification.InstanceType {
 						costScore, err := strconv.ParseFloat(instanceTypeRecommendation.CostScore, 64)
 						if err != nil {
-							log.Error(err)
+							log.WithField("autoScalingGroup", asgName).Error(err)
 							errorCount++
 						} else {
 							scrapes <- InstanceScrapeResult{
@@ -475,7 +481,7 @@ func (e *Exporter) scrapeInstances(scrapes chan<- InstanceScrapeResult, asgName 
 						}
 						stabilityScore, err := strconv.ParseFloat(instanceTypeRecommendation.StabilityScore, 64)
 						if err != nil {
-							log.Error(err)
+							log.WithField("autoScalingGroup", asgName).Error(err)
 							errorCount++
 						} else {
 							scrapes <- InstanceScrapeResult{
@@ -490,7 +496,7 @@ func (e *Exporter) scrapeInstances(scrapes chan<- InstanceScrapeResult, asgName 
 						}
 						currentPrice, err := strconv.ParseFloat(instanceTypeRecommendation.CurrentPrice, 64)
 						if err != nil {
-							log.Error(err)
+							log.WithField("autoScalingGroup", asgName).Error(err)
 							errorCount++
 						} else {
 							scrapes <- InstanceScrapeResult{
@@ -505,7 +511,7 @@ func (e *Exporter) scrapeInstances(scrapes chan<- InstanceScrapeResult, asgName 
 						}
 						onDemandPrice, err := strconv.ParseFloat(instanceTypeRecommendation.OnDemandPrice, 64)
 						if err != nil {
-							log.Error(err)
+							log.WithField("autoScalingGroup", asgName).Error(err)
 							errorCount++
 						} else {
 							scrapes <- InstanceScrapeResult{
@@ -520,7 +526,7 @@ func (e *Exporter) scrapeInstances(scrapes chan<- InstanceScrapeResult, asgName 
 						}
 						optimalBidPrice, err := strconv.ParseFloat(instanceTypeRecommendation.SuggestedBidPrice, 64)
 						if err != nil {
-							log.Error(err)
+							log.WithField("autoScalingGroup", asgName).Error(err)
 							errorCount++
 						} else {
 							scrapes <- InstanceScrapeResult{
