@@ -1,7 +1,6 @@
 ## AWS Autoscaling exporter
 
-Prometheus exporter for AWS auto scaling groups.
-Provides auto scaling group level metrics similar to CloudWatch metrics and instance level metrics for spot instances in the auto scaling group. For group level metrics the exporter is polling the AWS APIs for auto scaling groups. For instance level metrics it queries the Banzai Cloud spot instance [recommender API](https://github.com/banzaicloud/spot-recommender) to report cost and stability related metrics for spot instances.
+Prometheus exporter for AWS auto scaling groups, part of the [Hollowtrees](https://github.com/banzaicloud/hollowtrees) project. Provides auto scaling group level metrics similar to CloudWatch metrics and instance level metrics for spot instances in the auto scaling group. For group level metrics the exporter is polling the AWS APIs for auto scaling groups. For instance level metrics it queries the Banzai Cloud spot instance [recommender API](https://github.com/banzaicloud/spot-recommender) to report cost and stability related metrics for spot instances.
 
 ### Quick start
 
