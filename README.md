@@ -75,3 +75,8 @@ aws_instance_spot_bid_price{asg_name="marci-test",availability_zone="eu-west-1a"
 # TYPE aws_instance_stability_score gauge
 aws_instance_stability_score{asg_name="marci-test",availability_zone="eu-west-1a",instance_id="i-061ae0a2960e194be",instance_type="m5.xlarge",region="eu-west-1"} 0
 ```
+
+### Default Hollowtrees node exporters associated to alerts:
+
+* AWS spot instance termination [collector](https://github.com/banzaicloud/spot-termination-collector)
+* AWS autoscaling group [exporter](https://github.com/banzaicloud/aws-autoscaling-exporter)
