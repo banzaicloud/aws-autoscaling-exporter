@@ -8,6 +8,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
+	"strings"
 )
 
 var (
@@ -15,6 +16,7 @@ var (
 	metricsPath    = flag.String("metrics-path", "/metrics", "path to metrics endpoint")
 	rawLevel       = flag.String("log-level", "info", "log level")
 	region         = flag.String("region", "eu-west-1", "AWS region that the exporter should query")
+	groupsFlag     = flag.String("auto-scaling-groups", "", "Comma separated list of auto scaling groups to monitor. Empty value means all groups in the region.")
 	recommenderUrl = flag.String("recommender-url", "http://localhost:9090", "URL of the spot instance recommender")
 )
 
@@ -33,7 +35,11 @@ func main() {
 	log.Info("Starting AWS Auto Scaling Group exporter")
 	log.Infof("Starting metric http endpoint on %s", *addr)
 
-	exporter, err := exporter.NewExporter(*region, *recommenderUrl)
+	var groups []string
+	if *groupsFlag != "" {
+		groups = strings.Split(strings.Replace(*groupsFlag, " ", "", -1), ",")
+	}
+	exporter, err := exporter.NewExporter(*region, groups, *recommenderUrl)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -53,5 +59,7 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 		<h1>AWS Auto Scaling Group Exporter</h1>
 		<p><a href="` + *metricsPath + `">Metrics</a></p>
 		</body>
-		</html>`))
+		</html>
+	`))
+
 }

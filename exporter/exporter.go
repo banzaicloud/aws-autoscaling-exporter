@@ -21,6 +21,7 @@ import (
 // Exporter implements the prometheus.Exporter interface, and exports AWS AutoScaling metrics.
 type Exporter struct {
 	session         *session.Session
+	groups          []string
 	recommenderUrl  string
 	duration        prometheus.Gauge
 	scrapeErrors    prometheus.Gauge
@@ -69,7 +70,7 @@ func (e *instanceScrapeError) Error() string {
 }
 
 // NewExporter returns a new exporter of AWS Autoscaling group metrics.
-func NewExporter(region string, recommenderUrl string) (*Exporter, error) {
+func NewExporter(region string, groups []string, recommenderUrl string) (*Exporter, error) {
 
 	session, err := session.NewSession(&aws.Config{
 		Region: aws.String(region),
@@ -81,6 +82,7 @@ func NewExporter(region string, recommenderUrl string) (*Exporter, error) {
 
 	e := Exporter{
 		session:        session,
+		groups:         groups,
 		recommenderUrl: recommenderUrl,
 		duration: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "aws_autoscaling",
@@ -229,7 +231,9 @@ func (e *Exporter) scrape(groupScrapes chan<- GroupScrapeResult, instanceScrapes
 	var errorCount uint64 = 0
 
 	asgSvc := autoscaling.New(e.session, aws.NewConfig())
-	err := asgSvc.DescribeAutoScalingGroupsPages(&autoscaling.DescribeAutoScalingGroupsInput{}, func(result *autoscaling.DescribeAutoScalingGroupsOutput, lastPage bool) bool {
+	err := asgSvc.DescribeAutoScalingGroupsPages(&autoscaling.DescribeAutoScalingGroupsInput{
+		AutoScalingGroupNames: aws.StringSlice(e.groups),
+	}, func(result *autoscaling.DescribeAutoScalingGroupsOutput, lastPage bool) bool {
 		log.Debugf("Number of AutoScaling Groups found: %d [lastPage = %t]", len(result.AutoScalingGroups), lastPage)
 		var wg sync.WaitGroup
 		for _, asg := range result.AutoScalingGroups {
